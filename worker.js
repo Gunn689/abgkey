@@ -1,12 +1,11 @@
 // language: JavaScript, file: worker.js, runtime: Cloudflare Workers (V8)
-// ABGunnn License Server — auth + key management only
-
+// ABGunnn License Server — auth + admin
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
         const path = url.pathname;
 
-        // ============ HEALTH ============
+        // HEALTH
         if (request.method === 'GET' && (path === '/' || path === '/health')) {
             return json(200, {
                 status: true,
@@ -16,12 +15,12 @@ export default {
             });
         }
 
-        // ============ AUTH ============
+        // AUTH
         if (request.method === 'POST' && path === '/auth') {
             return handleAuth(request, env);
         }
 
-        // ============ ADMIN ============
+        // ADMIN
         if (request.method === 'POST' && path.startsWith('/admin/')) {
             return handleAdmin(request, env, path);
         }
@@ -30,27 +29,28 @@ export default {
     }
 };
 
-// ==================== AUTH ====================
-
 async function handleAuth(request, env) {
-    if (!env.AUTH_KEYS) {
-        return json(500, { valid: false, error: 'auth not configured' });
-    }
+    if (!env.AUTH_KEYS) return json(500, { valid: false, error: 'auth not configured' });
 
     try {
         const ct = request.headers.get('content-type') || '';
-        let key = '', hwid = '';
+        let key = '', hwid = '', device = '', android = '';
+
         if (ct.includes('application/x-www-form-urlencoded')) {
             const p = new URLSearchParams(await request.text());
-            key = (p.get('key') || '').trim().toUpperCase();
-            hwid = (p.get('hwid') || '').trim();
+            key     = (p.get('key')     || '').trim().toUpperCase();
+            hwid    = (p.get('hwid')    || '').trim();
+            device  = (p.get('device')  || '').trim();
+            android = (p.get('android') || '').trim();
         } else {
             const j = await request.json();
-            key = String(j.key || '').trim().toUpperCase();
-            hwid = String(j.hwid || '').trim();
+            key     = String(j.key     || '').trim().toUpperCase();
+            hwid    = String(j.hwid    || '').trim();
+            device  = String(j.device  || '').trim();
+            android = String(j.android || '').trim();
         }
 
-        if (!key) return json(400, { valid: false, error: 'key required' });
+        if (!key)  return json(400, { valid: false, error: 'key required' });
         if (!hwid) return json(400, { valid: false, error: 'hwid required' });
 
         const raw = await env.AUTH_KEYS.get(key);
@@ -62,22 +62,32 @@ async function handleAuth(request, env) {
 
         const now = Date.now();
 
+        // expiry
         if (data.expire && now > data.expire) {
             return json(200, { valid: false, reason: 'expired', expire: data.expire });
         }
 
+        // hwid binding
         data.hwids = data.hwids || [];
         const maxDevices = data.max || 1;
 
         if (data.hwids.length === 0) {
-            data.hwids.push(hwid);
+            data.hwids.push({ id: hwid, device, android, first_seen: now });
             await env.AUTH_KEYS.put(key, JSON.stringify(data));
-        } else if (!data.hwids.includes(hwid)) {
-            if (data.hwids.length >= maxDevices) {
-                return json(200, { valid: false, reason: 'hwid_mismatch', max: maxDevices });
+        } else {
+            const found = data.hwids.find(h => h.id === hwid);
+            if (!found) {
+                if (data.hwids.length >= maxDevices) {
+                    return json(200, { valid: false, reason: 'hwid_mismatch', max: maxDevices });
+                }
+                data.hwids.push({ id: hwid, device, android, first_seen: now });
+                await env.AUTH_KEYS.put(key, JSON.stringify(data));
+            } else {
+                // update last_seen
+                found.last_seen = now;
+                found.device = device || found.device;
+                await env.AUTH_KEYS.put(key, JSON.stringify(data));
             }
-            data.hwids.push(hwid);
-            await env.AUTH_KEYS.put(key, JSON.stringify(data));
         }
 
         return json(200, {
@@ -92,8 +102,6 @@ async function handleAuth(request, env) {
     }
 }
 
-// ==================== ADMIN ====================
-
 function checkAdmin(request, env) {
     const token = request.headers.get('x-admin-token') || '';
     if (!env.ADMIN_TOKEN) return false;
@@ -101,16 +109,13 @@ function checkAdmin(request, env) {
 }
 
 async function handleAdmin(request, env, path) {
-    if (!checkAdmin(request, env)) {
-        return json(401, { status: false, error: 'unauthorized' });
-    }
+    if (!checkAdmin(request, env)) return json(401, { status: false, error: 'unauthorized' });
 
     try {
         const ct = request.headers.get('content-type') || '';
         let body = {};
-        if (ct.includes('application/json')) {
-            body = await request.json();
-        } else {
+        if (ct.includes('application/json')) body = await request.json();
+        else {
             const p = new URLSearchParams(await request.text());
             p.forEach((v, k) => body[k] = v);
         }
@@ -129,8 +134,7 @@ async function handleAdmin(request, env, path) {
             await env.AUTH_KEYS.put(key, JSON.stringify(data));
 
             return json(200, {
-                status: true, key,
-                expire,
+                status: true, key, expire,
                 expire_readable: expire ? new Date(expire).toISOString() : 'never',
                 max, note
             });
@@ -188,8 +192,6 @@ function generateKey() {
         chars[Math.floor(Math.random() * chars.length)]).join('');
     return `ABG-${seg()}-${seg()}-${seg()}`;
 }
-
-// ==================== HELPERS ====================
 
 function json(code, data) {
     return new Response(JSON.stringify(data), {
